@@ -2,11 +2,14 @@ import customtkinter as ctk
 import os
 import cv2
 import re
+import subprocess
+import shutil
 from tkinter import messagebox
 import urllib.request
 from yt_dlp import YoutubeDL
 from PIL import Image
 from threading import Thread
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==========================================================
 # GENEL AYARLAR
@@ -17,457 +20,498 @@ ctk.set_default_color_theme("blue")
 BASE_OUTPUT = os.path.join(os.getcwd(), "cikti")
 os.makedirs(BASE_OUTPUT, exist_ok=True)
 
-preview_image_obj = None  # Önizleme için global referans
+preview_image_obj = None
+url_rows = []  # (url_entry, times_entry, row_frame)
+
+MAX_FRAME_WORKERS = max(2, min(8, (os.cpu_count() or 4)))
+DEFAULT_TIME_IF_EMPTY = [5]  # saniye kutusu boşsa playlist veya tek video için fallback
 
 
 # ==========================================================
-# YARDIMCI FONKSİYONLAR
+# TÜRKÇE -> ASCII + DOSYA GÜVENLİ SLUG
 # ==========================================================
-def clean_youtube_url(url: str) -> str:
-    """Shorts / youtu.be / watch?v= formatlarını normalize eder."""
-    url = url.strip()
+TR_MAP = str.maketrans({
+    "ç": "c", "Ç": "C",
+    "ğ": "g", "Ğ": "G",
+    "ı": "i", "İ": "I",
+    "ö": "o", "Ö": "O",
+    "ş": "s", "Ş": "S",
+    "ü": "u", "Ü": "U",
+})
 
-    # Shorts formatı
-    if "shorts" in url:
-        match = re.search(r"shorts/([A-Za-z0-9_-]{11})", url)
-        if match:
-            vid = match.group(1)
-            return f"https://www.youtube.com/watch?v={vid}"
-
-    # watch?v=
-    match = re.search(r"v=([A-Za-z0-9_-]{11})", url)
-    if match:
-        return f"https://www.youtube.com/watch?v={match.group(1)}"
-
-    # youtu.be/ID
-    match = re.search(r"youtu\.be/([A-Za-z0-9_-]{11})", url)
-    if match:
-        vid = match.group(1)
-        return f"https://www.youtube.com/watch?v={vid}"
-
-    return url
-
-
-def format_duration(seconds):
-    """Saniyeyi 00:00 veya 00:00:00 formatına çevirir."""
-    if not seconds:
-        return "bilinmiyor"
-    try:
-        seconds = int(seconds)
-    except (TypeError, ValueError):
-        return "bilinmiyor"
-    m, s = divmod(seconds, 60)
-    h, m = divmod(m, 60)
-    if h:
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    else:
-        return f"{m:02d}:{s:02d}"
-
+def turkish_to_ascii(s: str) -> str:
+    return (s or "").translate(TR_MAP)
 
 def slugify_title(title: str) -> str:
-    """Dosya sistemi için güvenli başlık üretir."""
-    if not title:
-        return "video"
-    s = title.strip()
-    # Windows için yasak olan karakterleri temizle
-    s = re.sub(r'[\\/*?:"<>|]', "", s)
-    # Boşlukları alt çizgi yap
-    s = re.sub(r"\s+", "_", s)
+    """Türkçe karakterleri düzeltir, dosya sistemi için temizler."""
+    s = turkish_to_ascii(title).strip()
+    s = re.sub(r'[\\/*?:"<>|]', "", s)  # yasak karakterler
+    s = re.sub(r"\s+", "_", s)          # boşluk -> _
+    s = re.sub(r"_+", "_", s)
     if not s:
         s = "video"
-    # Çok uzun olmasın (örnek: 150 karakterle sınırla)
     return s[:150]
 
 
 # ==========================================================
-# YT-DLP İLE BİLGİ ÇEKME
+# ZAMAN PARSE (10, 1:32, 00:01:32, 2:15:50)
+# ==========================================================
+def parse_time_to_seconds(tstr):
+    tstr = tstr.strip()
+    if ":" not in tstr:
+        return int(tstr)
+
+    parts = [p.strip() for p in tstr.split(":")]
+    if len(parts) == 2:  # MM:SS
+        m, s = parts
+        return int(m) * 60 + int(s)
+    if len(parts) == 3:  # HH:MM:SS
+        h, m, s = parts
+        return int(h) * 3600 + int(m) * 60 + int(s)
+
+    raise ValueError(f"Geçersiz zaman formatı: {tstr}")
+
+def parse_time_list(times_text):
+    """
+    "5, 1:20, 00:02:30" gibi listeyi parse eder.
+    Boşsa DEFAULT_TIME_IF_EMPTY döndürür.
+    """
+    times_text = (times_text or "").strip()
+    if not times_text:
+        return DEFAULT_TIME_IF_EMPTY[:]
+
+    items = [x.strip() for x in times_text.split(",") if x.strip()]
+    if not items:
+        return DEFAULT_TIME_IF_EMPTY[:]
+
+    out = []
+    for it in items:
+        out.append(parse_time_to_seconds(it))
+    return out
+
+def seconds_to_timestamp(sec: int) -> str:
+    """00-01-32 formatı (dosya adı güvenli)."""
+    sec = int(sec)
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    return f"{h:02d}-{m:02d}-{s:02d}"
+
+
+# ==========================================================
+# YARDIMCI — YouTube URL normalize
+# ==========================================================
+def clean_youtube_url(url: str) -> str:
+    url = url.strip()
+
+    if "shorts" in url:
+        m = re.search(r"shorts/([A-Za-z0-9_-]{11})", url)
+        if m:
+            return f"https://www.youtube.com/watch?v={m.group(1)}"
+
+    m = re.search(r"v=([A-Za-z0-9_-]{11})", url)
+    if m:
+        return f"https://www.youtube.com/watch?v={m.group(1)}"
+
+    m = re.search(r"youtu\.be/([A-Za-z0-9_-]{11})", url)
+    if m:
+        return f"https://www.youtube.com/watch?v={m.group(1)}"
+
+    return url
+
+
+# ==========================================================
+# ffmpeg yolu
+# ==========================================================
+def get_ffmpeg_path():
+    fn = shutil.which("ffmpeg")
+    if fn:
+        return fn
+
+    local = os.path.join(os.getcwd(), "ffmpeg.exe")
+    if os.path.exists(local):
+        return local
+
+    return None
+
+
+# ==========================================================
+# YT-DLP — info + playlist
 # ==========================================================
 def get_youtube_info(url: str):
-    """Tek bir video için en iyi video formatını getirir."""
-    ydl_opts = {
-        "quiet": True,
-        "skip_download": True,
-        "format": "bestvideo"
-    }
     try:
-        with YoutubeDL(ydl_opts) as ydl:
+        with YoutubeDL({
+            "quiet": True,
+            "skip_download": True,
+            "format": "best"
+        }) as ydl:
             return ydl.extract_info(url, download=False)
     except Exception:
         return None
 
-
-def get_playlist_videos(playlist_url):
-    """Playlist içindeki tüm video ID'lerini döndürür."""
+def get_playlist_videos(url):
+    """
+    Playlist içindeki tüm video ID'lerini döndürür.
+    Playlist URL'si watch+list içerebilir: yine playlist olarak ele alınacak.
+    """
     try:
-        ydl_opts = {
+        with YoutubeDL({
             "quiet": True,
             "extract_flat": True,
             "skip_download": True
-        }
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(playlist_url, download=False)
+        }) as ydl:
+            info = ydl.extract_info(url, download=False)
             if "entries" not in info:
                 return []
             return [e["id"] for e in info["entries"] if e and "id" in e]
-    except Exception:
+    except:
         return []
 
 
+def format_duration(seconds):
+    if not seconds:
+        return "bilinmiyor"
+    seconds = int(seconds)
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h:02}:{m:02}:{s:02}"
+    else:
+        return f"{m:02}:{s:02}"
+
+
 # ==========================================================
-# GUI GÜNCELLEYEN YARDIMCI FONKSİYONLAR (THREAD SAFE)
+# GUI yardımcıları (thread-safe)
 # ==========================================================
 def gui_log(msg: str):
-    app.after(0, lambda: (_log_insert(msg)))
+    app.after(0, lambda: _log(msg))
 
-
-def _log_insert(msg: str):
+def _log(msg: str):
     txt_log.insert("end", msg)
     txt_log.see("end")
 
+def gui_set_button_running(running: bool):
+    app.after(0, lambda: _btn_state(running))
 
-def gui_set_video_info(text: str):
-    app.after(0, lambda: lbl_video_info.configure(text=text))
+def _btn_state(running):
+    btn_start.configure(state="disabled" if running else "normal")
+    btn_add_row.configure(state="disabled" if running else "normal")
 
+def gui_set_video_info(t):
+    app.after(0, lambda: lbl_video_info.configure(text=t))
 
-def gui_set_playlist_progress(idx, total):
-    def _update():
-        if total <= 0:
-            progressbar_playlist.set(0)
-            lbl_playlist_progress.configure(text="Playlist ilerleme: -")
-        else:
-            p = idx / total
-            progressbar_playlist.set(p)
-            lbl_playlist_progress.configure(
-                text=f"Playlist ilerleme: {idx}/{total} (%{int(p * 100)})"
-            )
-
-    app.after(0, _update)
-
-
-def gui_set_single_video_progress():
-    app.after(0, lambda: (
-        progressbar_playlist.set(1),
-        lbl_playlist_progress.configure(text="Playlist ilerleme: Tek video")
-    ))
-
-
-def gui_set_button_running(is_running: bool):
-    def _update():
-        if is_running:
-            btn_start.configure(state="disabled", text="⏳ Çalışıyor...")
-        else:
-            btn_start.configure(state="normal", text="📷 Başlat (Frame + Thumbnail + Playlist)")
-    app.after(0, _update)
-
-
-def gui_show_done_message():
-    app.after(0, lambda: messagebox.showinfo("Bitti", "Tüm işlemler başarıyla tamamlandı."))
-
-
-def gui_set_preview_from_frame(frame):
-    """Frame'den önizleme oluşturur (GUI thread içinde çalışır)."""
+def gui_set_preview(frame):
     global preview_image_obj
     try:
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(frame_rgb)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
+        w, h = pil.size
+        maxw = 220
+        new_h = int(h * (maxw / w))
+        pil = pil.resize((maxw, new_h), Image.LANCZOS)
 
-        max_w = 220
-        w, h = pil_img.size
-        if w == 0:
-            return
-        new_h = int(h * (max_w / w))
-        pil_img = pil_img.resize((max_w, new_h), Image.LANCZOS)
-
-        preview_image_obj = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(max_w, new_h))
+        preview_image_obj = ctk.CTkImage(light_image=pil, dark_image=pil, size=(maxw, new_h))
         preview_label.configure(image=preview_image_obj, text="")
-    except Exception:
+    except:
         pass
 
 
 # ==========================================================
-# FRAME ÇIKARTMA + ÖNİZLEME (THREAD İÇİNDEN ÇAĞRILIR)
+# FFmpeg ile TEK frame çıkarma (worker)
 # ==========================================================
-def extract_frames(video_url, times, save_folder, safe_title):
-    cap = cv2.VideoCapture(video_url)
-
-    for t in times:
-        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-        ret, frame = cap.read()
-        if ret:
-            filename = f"{safe_title}_t{t}s.png"
-            out_path = os.path.join(save_folder, filename)
-            cv2.imwrite(out_path, frame)
-            gui_log(f"[OK] {t}s frame kaydedildi → {filename}\n")
-
-            # Önizleme güncelle
-            app.after(0, lambda f=frame: gui_set_preview_from_frame(f))
-        else:
-            gui_log(f"[X] {t}s frame alınamadı.\n")
-
-    cap.release()
+def _ffmpeg_grab_one(ffmpeg, stream_url, sec, out_path):
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel", "error",
+        "-ss", str(sec),
+        "-i", stream_url,
+        "-frames:v", "1",
+        "-q:v", "2",
+        "-y",
+        out_path
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    ok = (r.returncode == 0 and os.path.exists(out_path))
+    return ok, (r.stderr or "").strip()
 
 
 # ==========================================================
-# THUMBNAIL İNDİRME (THREAD İÇİNDEN)
+# FFmpeg ile frame çıkarma (PARALEL)
+# Dosya adı: {title}_{timestamp}_{id}.png
 # ==========================================================
-def download_thumbnail(info, save_folder, safe_title):
-    thumb = info.get("thumbnail")
-    if not thumb:
-        gui_log("[X] Thumbnail bulunamadı.\n")
+def extract_frames_ffmpeg_parallel(stream_url, times, save_folder, safe_title, video_id):
+    ffmpeg = get_ffmpeg_path()
+    if not ffmpeg:
+        gui_log("[X] ffmpeg bulunamadı! Program klasörüne ffmpeg.exe koy veya PATH'e ekle.\n")
         return
 
-    try:
-        filename = f"{safe_title}_thumbnail.png"
-        out_path = os.path.join(save_folder, filename)
-        urllib.request.urlretrieve(thumb, out_path)
-        gui_log(f"[OK] Thumbnail kaydedildi → {filename}\n")
-    except Exception as e:
-        gui_log(f"[X] Thumbnail indirilemedi: {e}\n")
+    futures = []
+    with ThreadPoolExecutor(max_workers=MAX_FRAME_WORKERS) as ex:
+        for sec in times:
+            ts = seconds_to_timestamp(sec)
+            filename = f"{safe_title}_{ts}_{video_id}.png"
+            out_path = os.path.join(save_folder, filename)
+            futures.append(ex.submit(_ffmpeg_grab_one, ffmpeg, stream_url, sec, out_path))
+
+        for fut in as_completed(futures):
+            try:
+                ok, err = fut.result()
+                # futures içinde çıkış yolu yoksa yeniden bulmak için sec'yi maplemek gerekir.
+                # Bu yüzden basitçe klasörde en son yazılanı preview'a basıyoruz.
+                if ok:
+                    gui_log("[OK] Frame kaydedildi.\n")
+                    # preview için son dosyayı bul
+                    try:
+                        newest = max(
+                            (os.path.join(save_folder, f) for f in os.listdir(save_folder) if f.endswith(".png")),
+                            key=os.path.getmtime
+                        )
+                        frame = cv2.imread(newest)
+                        if frame is not None:
+                            app.after(0, lambda f=frame: gui_set_preview(f))
+                    except:
+                        pass
+                else:
+                    gui_log(f"[X] Frame alınamadı. {err}\n")
+            except Exception as e:
+                gui_log(f"[X] Worker hata: {e}\n")
 
 
 # ==========================================================
-# TEK VİDEOYU İŞLE (THREAD İÇİNDEN)
+# Thumbnail indir
+# ==========================================================
+def download_thumbnail(info, folder, safe_title):
+    t = info.get("thumbnail")
+    if not t:
+        gui_log("[X] Thumbnail yok.\n")
+        return
+
+    out = os.path.join(folder, f"{safe_title}_thumbnail.png")
+    try:
+        urllib.request.urlretrieve(t, out)
+        gui_log(f"[OK] Thumbnail → {os.path.basename(out)}\n")
+    except Exception as e:
+        gui_log(f"[X] Thumbnail hata: {e}\n")
+
+
+# ==========================================================
+# Tek video işleme
 # ==========================================================
 def process_single_video(url, times):
     info = get_youtube_info(url)
     if not info:
-        gui_log(f"[X] Video bilgisi alınamadı → {url}\n\n")
+        gui_log(f"[X] Video info alınamadı → {url}\n")
         return
 
-    vid = info.get("id", "NOID")
-    title = info.get("title", "Bilinmeyen Başlık")
+    title = info.get("title", "Video")
+    safe_title = slugify_title(title)
+    video_id = info.get("id", "NOID")
+
     width = info.get("width")
     height = info.get("height")
-    duration = info.get("duration")
+    dur = info.get("duration")
 
-    res_str = f"{width}x{height}" if width and height else "bilinmiyor"
-    dur_str = format_duration(duration)
-    safe_title = slugify_title(title)
+    gui_set_video_info(f"{title} | {width}x{height} | {format_duration(dur)}")
+    gui_log(f"\n🎬 {title}\nID: {video_id}\n")
 
-    gui_set_video_info(f"Video: {title} | Çözünürlük: {res_str} | Süre: {dur_str}")
-    gui_log(f"\n🎬 {title}\nID: {vid}\nÇözünürlük: {res_str} | Süre: {dur_str}\n")
-
-    folder = os.path.join(BASE_OUTPUT, safe_title or vid)
+    folder = os.path.join(BASE_OUTPUT, safe_title)
     os.makedirs(folder, exist_ok=True)
 
-    extract_frames(info["url"], times, folder, safe_title)
+    stream_url = info.get("url")
+    if not stream_url:
+        gui_log("[X] Stream URL yok (YouTube korumalı olabilir).\n")
+        return
+
+    # Paralel frame çıkarma
+    extract_frames_ffmpeg_parallel(stream_url, times, folder, safe_title, video_id)
+
+    # Thumbnail
     download_thumbnail(info, folder, safe_title)
 
-    gui_log(f"✔ Bitti → {folder}\n\n")
+    gui_log(f"✔ Tamam → {folder}\n")
 
 
 # ==========================================================
-# ANA İŞ PARÇASI (THREAD)
+# Playlist / Çoklu işleyici
+# Playlist verilirse: önce tüm video URL'leri alınır,
+# sonra satırdaki saniyeler (boşsa 5) hepsine uygulanır.
 # ==========================================================
-def worker_process(urls, times):
-    # Başlat
-    gui_set_video_info("Video bilgisi: -")
-    gui_set_playlist_progress(0, 0)
+def worker_process(rows):
+    for url, times in rows:
+        gui_log(f"\n=== İşleniyor: {url} | Saniyeler: {times} ===\n")
 
-    for url in urls:
-        gui_log(f"\n=== İşleniyor: {url} ===\n")
-
-        # Playlist mi?
         if "list=" in url:
-            gui_log("▶ Playlist algılandı, video listesi alınıyor...\n")
-            playlist_ids = get_playlist_videos(url)
+            gui_log("▶ Playlist algılandı, tüm video URL'leri alınıyor...\n")
+            ids = get_playlist_videos(url)
 
-            if not playlist_ids:
-                gui_log("[X] Playlist okunamadı veya boş.\n")
+            if not ids:
+                gui_log("[X] Playlist boş veya okunamadı.\n")
                 continue
 
-            total = len(playlist_ids)
-            gui_log(f"Toplam video: {total}\n\n")
+            total = len(ids)
+            gui_log(f"Toplam video: {total}\n")
 
-            for idx, vid in enumerate(playlist_ids, start=1):
+            for idx, vid in enumerate(ids, start=1):
                 vurl = f"https://www.youtube.com/watch?v={vid}"
-                gui_set_playlist_progress(idx, total)
+                gui_log(f"\n--- Playlist video {idx}/{total} ---\n")
                 process_single_video(vurl, times)
-
-            gui_set_playlist_progress(total, total)
         else:
-            gui_set_single_video_progress()
             process_single_video(url, times)
 
-    gui_log(f"\n✔ TÜM İŞLEM TAMAMLANDI\nÇıktı klasörü: {BASE_OUTPUT}\n")
+    gui_log("\n✔ TÜM İŞLEM BİTTİ.\n")
     gui_set_button_running(False)
-    gui_show_done_message()
+    messagebox.showinfo("Bitti", "İşlem tamamlandı.")
 
 
 # ==========================================================
-# BUTON TIK: PARAM HAZIRLA + THREAD BAŞLAT
+# Başlat tıklandı
 # ==========================================================
 def start_process():
-    urls_raw = txt_urls.get("0.0", "end").strip()
-    if not urls_raw:
-        messagebox.showwarning("Uyarı", "Lütfen en az bir URL veya playlist ID gir.")
-        return
+    collected = []
 
-    raw_lines = [u.strip() for u in urls_raw.splitlines() if u.strip()]
-    urls = []
+    for url_entry, time_entry, _rf in url_rows:
+        u = url_entry.get().strip()
+        t = time_entry.get().strip()
+        if not u:
+            continue
 
-    # HTTP yoksa playlist ID kabul et
-    for line in raw_lines:
-        if line.startswith("http"):
-            urls.append(clean_youtube_url(line))
+        if u.startswith("http"):
+            url = clean_youtube_url(u)
         else:
-            urls.append(f"https://www.youtube.com/playlist?list={line}")
+            url = f"https://www.youtube.com/playlist?list={u}"
 
-    # Saniyeler
-    try:
-        times = [int(x.strip()) for x in entry_times.get().split(",") if x.strip()]
-    except Exception:
-        messagebox.showerror("Hata", "Saniyeler yanlış formatta. Ör: 0,1,3,5")
+        try:
+            times = parse_time_list(t)  # boşsa [5]
+        except Exception as e:
+            messagebox.showerror("Hata", str(e))
+            return
+
+        collected.append((url, times))
+
+    if not collected:
+        messagebox.showwarning("Uyarı", "En az 1 satır doldur.")
         return
 
-    # Log ve info temizle
-    txt_log.configure(state="normal")
     txt_log.delete("0.0", "end")
-    lbl_video_info.configure(text="Video bilgisi: -")
-    progressbar_playlist.set(0)
-    lbl_playlist_progress.configure(text="Playlist ilerleme: -")
-
     gui_set_button_running(True)
 
-    # Ağır işlemi thread'e al
-    t = Thread(target=worker_process, args=(urls, times), daemon=True)
-    t.start()
+    th = Thread(target=worker_process, args=(collected,), daemon=True)
+    th.start()
 
 
 # ==========================================================
-# 🎨 METRO TASARIMLI GUI
+# Dinamik satır ekle/sil
+# Varsayılan saniye kutusu: 5
+# ==========================================================
+def add_url_row(url_text="", time_text="5"):
+    row = ctk.CTkFrame(url_scroll, corner_radius=8)
+    row.pack(fill="x", pady=5, padx=5)
+
+    url_entry = ctk.CTkEntry(row, height=34, font=("Segoe UI", 13))
+    url_entry.insert(0, url_text)
+    url_entry.pack(side="left", fill="x", expand=True, padx=5)
+
+    time_entry = ctk.CTkEntry(row, width=180, height=34, font=("Segoe UI", 13))
+    time_entry.insert(0, time_text)
+    time_entry.pack(side="left", padx=5)
+
+    def remove_row():
+        row.destroy()
+        for idx, (ue, te, rf) in enumerate(url_rows):
+            if rf == row:
+                url_rows.pop(idx)
+                break
+
+    del_btn = ctk.CTkButton(
+        row, text="Sil", width=60,
+        fg_color="#AA0000", hover_color="#770000",
+        command=remove_row
+    )
+    del_btn.pack(side="left", padx=5)
+
+    url_rows.append((url_entry, time_entry, row))
+
+
+# ==========================================================
+# GUI
 # ==========================================================
 app = ctk.CTk()
-app.title("YouTube Screenshot Extractor PRO")
-app.geometry("900x700")
-app.minsize(900, 700)
+app.title("YouTube Screenshot Extractor PRO — FFmpeg + Paralel Frame")
+app.geometry("1020x780")
 
-# HEADER
 header = ctk.CTkFrame(app, height=60, corner_radius=0)
 header.pack(fill="x")
-
 ctk.CTkLabel(
     header,
-    text="📺 YouTube Screenshot Extractor PRO",
-    font=("Segoe UI Semibold", 22)
-).pack(side="left", padx=20)
+    text="📺 YouTube Screenshot Extractor PRO (FFmpeg + Paralel)",
+    font=("Segoe UI Semibold", 23)
+).pack(side="left", padx=15)
 
-ctk.CTkLabel(
-    header,
-    text="4K Frames + Thumbnail · Playlist Destekli · Metro UI",
-    font=("Segoe UI", 13)
-).pack(side="right", padx=20)
-
-# MAIN FRAME
-main = ctk.CTkFrame(app, corner_radius=16)
+main = ctk.CTkFrame(app)
 main.pack(fill="both", expand=True, padx=20, pady=20)
 
-# URL BOX
-box1 = ctk.CTkFrame(main, corner_radius=12)
-box1.pack(fill="x", padx=12, pady=(15, 10))
+# URL LIST TABLE
+box1 = ctk.CTkFrame(main)
+box1.pack(fill="x", pady=10)
 
-ctk.CTkLabel(
-    box1,
-    text="YouTube URL veya Playlist ID Listesi (Her satıra 1 tane):",
-    font=("Segoe UI Semibold", 14)
-).pack(anchor="w", padx=10, pady=8)
+ctk.CTkLabel(box1, text="URL + Saniyeler:", font=("Segoe UI Semibold", 15)).pack(anchor="w", padx=10)
 
-txt_urls = ctk.CTkTextbox(box1, height=120, font=("Segoe UI", 13))
-txt_urls.pack(fill="x", padx=10, pady=(0, 10))
+header_row = ctk.CTkFrame(box1)
+header_row.pack(fill="x", padx=8, pady=5)
 
-# ALT FRAME (sol: ayarlar/log, sağ: önizleme)
-bottom_frame = ctk.CTkFrame(main, corner_radius=12)
-bottom_frame.pack(fill="both", expand=True, padx=12, pady=(10, 10))
+ctk.CTkLabel(header_row, text="YouTube URL / Playlist", width=500, anchor="w")\
+    .pack(side="left", padx=10)
+ctk.CTkLabel(header_row, text="Saniyeler (5, 1:20, 00:01:30)", width=250, anchor="w")\
+    .pack(side="left", padx=10)
 
-left_frame = ctk.CTkFrame(bottom_frame, corner_radius=12)
-left_frame.pack(side="left", fill="both", expand=True, padx=(0, 8), pady=10)
+url_scroll = ctk.CTkScrollableFrame(box1, height=200)
+url_scroll.pack(fill="x", padx=10, pady=5)
 
-right_frame = ctk.CTkFrame(bottom_frame, corner_radius=12, width=240)
-right_frame.pack(side="right", fill="y", padx=(8, 0), pady=10)
-
-# SOL: Saniye + buton + progress + log
-box2 = ctk.CTkFrame(left_frame, corner_radius=12)
-box2.pack(fill="x", padx=10, pady=(10, 10))
-
-ctk.CTkLabel(
-    box2,
-    text="Kaçıncı saniyelerden frame alınacak? (örn: 0,1,3,5)",
-    font=("Segoe UI Semibold", 14)
-).pack(anchor="w", padx=10, pady=8)
-
-entry_times = ctk.CTkEntry(box2, height=36, font=("Segoe UI", 14))
-entry_times.insert(0, "0,1,3,5")
-entry_times.pack(fill="x", padx=10, pady=(0, 10))
-
-# Playlist progress bar
-progress_frame = ctk.CTkFrame(box2, corner_radius=8)
-progress_frame.pack(fill="x", padx=10, pady=(0, 10))
-
-lbl_playlist_progress = ctk.CTkLabel(
-    progress_frame,
-    text="Playlist ilerleme: -",
-    font=("Segoe UI", 12)
+btn_add_row = ctk.CTkButton(
+    box1, text="+ Satır Ekle", width=120,
+    fg_color="#0066CC", hover_color="#004C99",
+    command=lambda: add_url_row()
 )
-lbl_playlist_progress.pack(anchor="w", padx=6, pady=(4, 2))
+btn_add_row.pack(padx=10, pady=5)
 
-progressbar_playlist = ctk.CTkProgressBar(progress_frame, height=10)
-progressbar_playlist.pack(fill="x", padx=6, pady=(0, 6))
-progressbar_playlist.set(0)
+# İlk satır
+add_url_row()
 
-# Başlat butonu
+# Bottom area
+bottom_frame = ctk.CTkFrame(main)
+bottom_frame.pack(fill="both", expand=True, pady=10)
+
+left = ctk.CTkFrame(bottom_frame)
+left.pack(side="left", fill="both", expand=True, padx=5)
+
+right = ctk.CTkFrame(bottom_frame, width=250)
+right.pack(side="right", fill="y", padx=5)
+
 btn_start = ctk.CTkButton(
-    box2,
-    text="📷 Başlat (Frame + Thumbnail + Playlist)",
-    font=("Segoe UI Semibold", 16),
-    height=40,
-    fg_color="#0078D7",
-    hover_color="#005A9E",
+    left, text="📸 Başlat", height=45,
+    fg_color="#0078D7", hover_color="#005A9E",
     command=start_process
 )
-btn_start.pack(pady=(0, 10), padx=10)
+btn_start.pack(fill="x", padx=10, pady=10)
 
-# Video info + log
-box3 = ctk.CTkFrame(left_frame, corner_radius=12)
-box3.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+lbl_video_info = ctk.CTkLabel(left, text="Video bilgisi: -", anchor="w")
+lbl_video_info.pack(fill="x", padx=10, pady=5)
 
-lbl_video_info = ctk.CTkLabel(
-    box3,
-    text="Video bilgisi: -",
-    font=("Segoe UI", 12)
-)
-lbl_video_info.pack(anchor="w", padx=10, pady=8)
+txt_log = ctk.CTkTextbox(left, font=("Consolas", 11))
+txt_log.pack(fill="both", expand=True, padx=10, pady=10)
 
-ctk.CTkLabel(
-    box3,
-    text="İşlem Logu:",
-    font=("Segoe UI Semibold", 14)
-).pack(anchor="w", padx=10, pady=(0, 4))
-
-txt_log = ctk.CTkTextbox(box3, font=("Consolas", 11))
-txt_log.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-
-# SAĞ: ÖNİZLEME PANELİ
-ctk.CTkLabel(
-    right_frame,
-    text="Son Frame Önizleme",
-    font=("Segoe UI Semibold", 14)
-).pack(anchor="center", pady=(10, 5))
-
+ctk.CTkLabel(right, text="Önizleme:", font=("Segoe UI Semibold", 14)).pack(pady=5)
 preview_label = ctk.CTkLabel(
-    right_frame,
-    text="Henüz önizleme yok",
-    width=220,
-    height=140,
-    corner_radius=12
+    right, text="Henüz yok", width=220, height=140, corner_radius=12
 )
-preview_label.pack(pady=(5, 10), padx=10)
+preview_label.pack(pady=10)
 
 ctk.CTkLabel(
-    right_frame,
-    text="Her işlenen videoda\nson alınan frame burada görünür.",
+    right,
+    text=f"Frame'ler paralel alınır.\nWorkers: {MAX_FRAME_WORKERS}",
     font=("Segoe UI", 11),
     justify="center"
-).pack(pady=(0, 10))
+).pack(pady=5)
 
-# UYGULAMAYI BAŞLAT
 app.mainloop()
